@@ -1,8 +1,8 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "gmulz:linear-actuator-with-position",
-  "visibility": "private",
-  "url": "",
+  "visibility": "public_unlisted",
+  "url": "https://github.com/gmulz/viam-linear-actuator-position-feedback",
   "description": "Modular gantry component: linear-actuator",
   "models": [
     {

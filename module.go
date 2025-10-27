@@ -125,14 +125,30 @@ func (s *linearActuatorWithPositionLinearActuator) Name() resource.Name {
 	return s.name
 }
 
-// Position returns the position in meters.
+// Position returns the position in millimeters.
 func (s *linearActuatorWithPositionLinearActuator) Position(ctx context.Context, extra map[string]interface{}) ([]float64, error) {
-	return nil, fmt.Errorf("not implemented")
+	if s.maxSensorPosition == nil || s.minSensorPosition == nil {
+		return nil, fmt.Errorf("sensor position values unknown. please run the Home command")
+	}
+	currReadings, err := s.positionSensor.Readings(ctx, extra)
+	if err != nil {
+		return nil, fmt.Errorf("could not read position from sensor")
+	}
+	currReading, ok := currReadings[s.positionSensorField]
+	if !ok {
+		return nil, fmt.Errorf("position field not found in sensor readings")
+	}
+	currSensorPosition, ok := currReading.(float64)
+	if !ok {
+		return nil, fmt.Errorf("position field is not a number")
+	}
+
+	return []float64{(currSensorPosition - *s.minSensorPosition) / (*s.maxSensorPosition - *s.minSensorPosition) * float64(s.strokeLength)}, nil
 }
 
-// Lengths is the length of gantries in meters.
+// Lengths is the length of gantries in millimeters.
 func (s *linearActuatorWithPositionLinearActuator) Lengths(ctx context.Context, extra map[string]interface{}) ([]float64, error) {
-	return nil, fmt.Errorf("not implemented")
+	return []float64{float64(s.strokeLength)}, nil
 }
 
 // Home runs the homing sequence of the gantry and returns true once completed.
@@ -162,12 +178,13 @@ func (s *linearActuatorWithPositionLinearActuator) Home(ctx context.Context, ext
 	if !ok {
 		return false, fmt.Errorf("position sensor field %s not found", s.positionSensorField)
 	}
-	positionValue, ok := position.(float64)
+	extendedPositionValue, ok := position.(float64)
 	if !ok {
 		return false, fmt.Errorf("position sensor field %s is not a float64", s.positionSensorField)
 	}
-	s.maxSensorPosition = &positionValue
+	s.maxSensorPosition = &extendedPositionValue
 	// todo: take several readings and take the average
+	s.logger.Infof("got extended position value %v", *s.maxSensorPosition)
 
 	// Retract the actuator fully
 	err = s.motor.SetPower(ctx, -1.0, extra)
@@ -186,13 +203,18 @@ func (s *linearActuatorWithPositionLinearActuator) Home(ctx context.Context, ext
 	if err != nil {
 		return false, fmt.Errorf("failed to read position sensor at retracted extension: %w", err)
 	}
-	positionValue, ok = position.(float64)
+	position, ok = readings[s.positionSensorField]
+	if !ok {
+		return false, fmt.Errorf("position sensor field %s not found", s.positionSensorField)
+	}
+	retractedPositionValue, ok := position.(float64)
 	if !ok {
 		return false, fmt.Errorf("position sensor field %s is not a float64", s.positionSensorField)
 	}
-	s.minSensorPosition = &positionValue
-	// todo: take several readings and take the average
 
+	s.minSensorPosition = &retractedPositionValue
+	// todo: take several readings and take the average
+	s.logger.Infof("got retracted position value %v", *s.minSensorPosition)
 	return true, nil
 }
 

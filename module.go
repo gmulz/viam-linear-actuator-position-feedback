@@ -33,8 +33,8 @@ type SensorConfig struct {
 }
 
 type Config struct {
-	StrokeLength     int32        `json:"stroke_length"`
-	MaxExtensionTime *int32       `json:"max_extension_time,omitempty"`
+	StrokeLength     float64      `json:"stroke_length"`
+	MaxExtensionTime *float64     `json:"max_extension_time,omitempty"`
 	Motor            string       `json:"motor"`
 	Sensor           SensorConfig `json:"position_sensor"`
 }
@@ -72,8 +72,8 @@ type linearActuatorWithPositionLinearActuator struct {
 	cancelCtx  context.Context
 	cancelFunc func()
 
-	strokeLength        int32
-	maxExtensionTime    *int32
+	strokeLength        float64
+	maxExtensionTime    *float64
 	positionSensorField string
 	positionSensor      sensor.Sensor
 	motor               motor.Motor
@@ -125,6 +125,22 @@ func (s *linearActuatorWithPositionLinearActuator) Name() resource.Name {
 	return s.name
 }
 
+func (s *linearActuatorWithPositionLinearActuator) readPositionFromSensor(ctx context.Context, extra map[string]any) (float64, error) {
+	readings, err := s.positionSensor.Readings(ctx, extra)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read position sensor: %w", err)
+	}
+	position, ok := readings[s.positionSensorField]
+	if !ok {
+		return 0, fmt.Errorf("position sensor field %s not found", s.positionSensorField)
+	}
+	positionValue, ok := position.(float64)
+	if !ok {
+		return 0, fmt.Errorf("position sensor field %s is not a number", s.positionSensorField)
+	}
+	return positionValue, nil
+}
+
 // Position returns the position in millimeters.
 func (s *linearActuatorWithPositionLinearActuator) Position(ctx context.Context, extra map[string]interface{}) ([]float64, error) {
 	if s.maxSensorPosition == nil || s.minSensorPosition == nil {
@@ -170,21 +186,13 @@ func (s *linearActuatorWithPositionLinearActuator) Home(ctx context.Context, ext
 	}
 
 	// Read the position sensor
-	readings, err := s.positionSensor.Readings(ctx, extra)
+	extendedPositionValue, err := s.readPositionFromSensor(ctx, extra)
 	if err != nil {
-		return false, fmt.Errorf("failed to read position sensor at full extension: %w", err)
-	}
-	position, ok := readings[s.positionSensorField]
-	if !ok {
-		return false, fmt.Errorf("position sensor field %s not found", s.positionSensorField)
-	}
-	extendedPositionValue, ok := position.(float64)
-	if !ok {
-		return false, fmt.Errorf("position sensor field %s is not a float64", s.positionSensorField)
+		return false, err
 	}
 	s.maxSensorPosition = &extendedPositionValue
 	// todo: take several readings and take the average
-	s.logger.Infof("got extended position value %v", *s.maxSensorPosition)
+	s.logger.Infof("home sequence found extended position value %v", *s.maxSensorPosition)
 
 	// Retract the actuator fully
 	err = s.motor.SetPower(ctx, -1.0, extra)
@@ -199,33 +207,73 @@ func (s *linearActuatorWithPositionLinearActuator) Home(ctx context.Context, ext
 	}
 
 	// Read the position sensor
-	readings, err = s.positionSensor.Readings(ctx, extra)
+	retractedPositionValue, err := s.readPositionFromSensor(ctx, extra)
 	if err != nil {
-		return false, fmt.Errorf("failed to read position sensor at retracted extension: %w", err)
-	}
-	position, ok = readings[s.positionSensorField]
-	if !ok {
-		return false, fmt.Errorf("position sensor field %s not found", s.positionSensorField)
-	}
-	retractedPositionValue, ok := position.(float64)
-	if !ok {
-		return false, fmt.Errorf("position sensor field %s is not a float64", s.positionSensorField)
+		return false, err
 	}
 
 	s.minSensorPosition = &retractedPositionValue
 	// todo: take several readings and take the average
-	s.logger.Infof("got retracted position value %v", *s.minSensorPosition)
+	s.logger.Infof("home sequence found retracted position value %v", *s.minSensorPosition)
 	return true, nil
 }
 
 // MoveToPosition is in meters.
 // This will block until done or a new operation cancels this one.
 func (s *linearActuatorWithPositionLinearActuator) MoveToPosition(ctx context.Context, positionsMm []float64, speedsMmPerSec []float64, extra map[string]interface{}) error {
-	return fmt.Errorf("not implemented")
+	if s.maxSensorPosition == nil || s.minSensorPosition == nil {
+		return fmt.Errorf("sensor position values unknown. please run the Home command")
+	}
+	if len(positionsMm) == 0 || len(positionsMm) > 1 {
+		return fmt.Errorf("incorrect number of positions for this actuator component: %v", len(positionsMm))
+	}
+	positionToMove := positionsMm[0]
+	if positionToMove > s.strokeLength {
+		return errors.New("position is larger than the length of the actuator")
+	}
+	if positionToMove < 0 {
+		return errors.New("position must be positive")
+	}
+	sensorPositionToMove := (positionToMove / s.strokeLength) * (*s.maxSensorPosition - *s.minSensorPosition)
+
+	currPosition, err := s.readPositionFromSensor(ctx, extra)
+	if err != nil {
+		return err
+	}
+
+	var dir float64
+	if currPosition > sensorPositionToMove {
+		dir = -1
+	} else {
+		dir = 1
+	}
+	s.motor.SetPower(ctx, dir, extra)
+	defer s.motor.SetPower(ctx, 0, extra)
+
+	startTime := time.Now()
+	var timeout time.Duration
+	if s.maxExtensionTime != nil {
+		timeout = time.Duration(*s.maxExtensionTime) * time.Second
+	} else {
+		timeout = time.Duration(30) * time.Second
+	}
+	// poll sensor value at 50hz until it's at or past the position
+	for ((currPosition-sensorPositionToMove)*dir < 0 ||
+		currPosition >= *s.maxSensorPosition ||
+		currPosition <= *s.minSensorPosition) &&
+		time.Since(startTime) < timeout {
+		time.Sleep(20 * time.Millisecond)
+		currPosition, err = s.readPositionFromSensor(ctx, extra)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *linearActuatorWithPositionLinearActuator) Stop(ctx context.Context, extra map[string]interface{}) error {
-	return fmt.Errorf("not implemented")
+	return s.motor.Stop(ctx, extra)
 }
 
 func (s *linearActuatorWithPositionLinearActuator) Kinematics(ctx context.Context) (referenceframe.Model, error) {
@@ -247,7 +295,7 @@ func (s *linearActuatorWithPositionLinearActuator) DoCommand(ctx context.Context
 }
 
 func (s *linearActuatorWithPositionLinearActuator) IsMoving(ctx context.Context) (bool, error) {
-	return false, fmt.Errorf("not implemented")
+	return s.motor.IsMoving(ctx)
 }
 
 func (s *linearActuatorWithPositionLinearActuator) Close(context.Context) error {

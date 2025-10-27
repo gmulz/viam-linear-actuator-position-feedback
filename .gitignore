@@ -1,0 +1,6 @@
+.DS_Store
+
+# Go
+/pkg
+/bin
+/out
